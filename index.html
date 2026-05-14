@@ -1,0 +1,1105 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="NexusBase">
+<title>NexusBase — Knowledge Base</title>
+
+<!--
+╔══════════════════════════════════════════════════════════════════╗
+║           NEXUSBASE — UNIVERSAL SYNC SETUP GUIDE                ║
+║                                                                  ║
+║  STEP 1 — Host this file (free, 5 min)                          ║
+║  ─────────────────────────────────────────────────────────────  ║
+║  Google OAuth requires a real URL (not file://). Easiest way:  ║
+║                                                                  ║
+║  a) Go to https://github.com and create a free account          ║
+║  b) Create a new repository called "nexusbase" (public)         ║
+║  c) Upload this HTML file renamed to "index.html"               ║
+║  d) Go to Settings → Pages → Source: main branch → / (root)    ║
+║  e) Your app URL will be: https://YOURNAME.github.io/nexusbase  ║
+║                                                                  ║
+║  STEP 2 — Get a Google Client ID (free, 5 min)                  ║
+║  ─────────────────────────────────────────────────────────────  ║
+║  a) Go to https://console.cloud.google.com                       ║
+║  b) Create a new project (e.g. "NexusBase")                     ║
+║  c) APIs & Services → Enable APIs → enable "Google Drive API"   ║
+║  d) APIs & Services → Credentials → Create OAuth 2.0 Client ID  ║
+║     · Application type: Web application                         ║
+║     · Authorised JavaScript origins:                            ║
+║       https://YOURNAME.github.io                                ║
+║       http://localhost (for local testing)                       ║
+║  e) Copy the Client ID — it looks like:                         ║
+║     123456789-abc.apps.googleusercontent.com                    ║
+║  f) Paste it into GOOGLE_CLIENT_ID below (replace the           ║
+║     placeholder text)                                            ║
+║                                                                  ║
+║  STEP 3 — Done                                                   ║
+║  ─────────────────────────────────────────────────────────────  ║
+║  Open your GitHub Pages URL on Mac, Windows, and iPhone.        ║
+║  Sign in with Google once on each device. Notes sync            ║
+║  automatically via a file in your Google Drive called           ║
+║  "nexusbase-data.json". Works offline too — syncs when          ║
+║  you reconnect.                                                  ║
+╚══════════════════════════════════════════════════════════════════╝
+-->
+
+<!-- ▼▼▼ PASTE YOUR GOOGLE CLIENT ID HERE ▼▼▼ -->
+<script>
+  window.GOOGLE_CLIENT_ID = "YOUR_GOOGLE_CLIENT_ID.apps.googleusercontent.com";
+</script>
+<!-- ▲▲▲ ──────────────────────────────── ▲▲▲ -->
+
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@tabler/icons-webfont@2.47.0/tabler-icons.min.css">
+<script src="https://cdn.jsdelivr.net/npm/react@18/umd/react.production.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/react-dom@18/umd/react-dom.production.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@babel/standalone@7.23.3/babel.min.js"></script>
+<!-- Google Identity Services (OAuth 2.0 token flow) -->
+<script src="https://accounts.google.com/gsi/client" async></script>
+
+<style>
+html,body,#root{margin:0;padding:0;height:100%;overflow:hidden;}
+body{background:#18191b;}
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel" data-presets="react">
+const{useState,useRef,useCallback,useEffect,useMemo,memo,useReducer}=React;
+
+/* ─── GOOGLE DRIVE SYNC ──────────────────────────────────────────────────────
+   Uses OAuth 2.0 implicit token flow (no server needed).
+   Stores all notes in a single file: nexusbase-data.json in Drive root.
+   Falls back to IndexedDB when offline or not signed in.
+──────────────────────────────────────────────────────────────────────────── */
+const DRIVE_FILE_NAME = "nexusbase-data.json";
+const DRIVE_SCOPE     = "https://www.googleapis.com/auth/drive.appdata https://www.googleapis.com/auth/drive.file";
+
+// Token stored in memory only (never localStorage — security)
+let _gToken = null;
+let _tokenExpiry = 0;
+
+function tokenValid() { return _gToken && Date.now() < _tokenExpiry; }
+
+// Request an access token via Google Identity Services popup
+function requestGoogleToken(clientId) {
+  return new Promise((resolve, reject) => {
+    if (!window.google?.accounts?.oauth2) { reject(new Error("GSI not loaded")); return; }
+    const client = window.google.accounts.oauth2.initTokenClient({
+      client_id: clientId,
+      scope: DRIVE_SCOPE,
+      callback: (resp) => {
+        if (resp.error) { reject(new Error(resp.error)); return; }
+        _gToken = resp.access_token;
+        _tokenExpiry = Date.now() + (resp.expires_in - 60) * 1000;
+        resolve(_gToken);
+      },
+    });
+    client.requestAccessToken({ prompt: "consent" });
+  });
+}
+
+async function driveReq(method, url, body, token) {
+  const headers = { Authorization: `Bearer ${token}` };
+  if (body && !(body instanceof FormData)) headers["Content-Type"] = "application/json";
+  const res = await fetch(url, { method, headers, body: body instanceof FormData ? body : body ? JSON.stringify(body) : undefined });
+  if (!res.ok) throw new Error(`Drive API ${res.status}: ${await res.text()}`);
+  const ct = res.headers.get("content-type") || "";
+  return ct.includes("json") ? res.json() : res.text();
+}
+
+// Find nexusbase-data.json in appDataFolder, return fileId or null
+async function findDriveFile(token) {
+  const res = await driveReq("GET",
+    "https://www.googleapis.com/drive/v3/files?spaces=appDataFolder&q=name%3D%27nexusbase-data.json%27&fields=files(id,name)",
+    null, token);
+  return res.files?.length ? res.files[0].id : null;
+}
+
+// Read file content
+async function readDriveFile(fileId, token) {
+  const text = await driveReq("GET",
+    `https://www.googleapis.com/drive/v3/files/${fileId}?alt=media`,
+    null, token);
+  return typeof text === "string" ? JSON.parse(text) : text;
+}
+
+// Create or update file
+async function writeDriveFile(fileId, data, token) {
+  const content = JSON.stringify(data);
+  const blob = new Blob([content], { type: "application/json" });
+
+  if (fileId) {
+    // Update existing
+    const form = new FormData();
+    form.append("metadata", new Blob([JSON.stringify({})], { type: "application/json" }));
+    form.append("file", blob);
+    return driveReq("PATCH",
+      `https://www.googleapis.com/upload/drive/v3/files/${fileId}?uploadType=multipart`,
+      form, token);
+  } else {
+    // Create new in appDataFolder (invisible to user's Drive, only accessible by this app)
+    const form = new FormData();
+    form.append("metadata", new Blob([JSON.stringify({
+      name: DRIVE_FILE_NAME,
+      parents: ["appDataFolder"]
+    })], { type: "application/json" }));
+    form.append("file", blob);
+    return driveReq("POST",
+      "https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id",
+      form, token);
+  }
+}
+
+/* ─── RFC-4180 CSV PARSER ────────────────────────────────────────────────── */
+function parseCSV(text){
+  const rows=[];let inQ=false,field="",row=[];
+  const push=()=>{row.push(field);field="";};
+  const next=()=>{rows.push(row);row=[];};
+  for(let i=0;i<text.length;i++){
+    const c=text[i],n=text[i+1];
+    if(inQ){if(c==='"'&&n==='"'){field+='"';i++;}else if(c==='"'){inQ=false;}else{field+=c;}}
+    else{if(c==='"'){inQ=true;}else if(c===','){push();}else if(c==='\r'&&n==='\n'){push();next();i++;}else if(c==='\n'||c==='\r'){push();next();}else{field+=c;}}
+  }
+  push();if(row.length>1||row[0]!=="")next();
+  return rows;
+}
+function csvToObjects(text){
+  const rows=parseCSV(text.trim());
+  if(rows.length<2)return{fields:[],data:[]};
+  const fields=rows[0];
+  const data=rows.slice(1).filter(r=>r.some(c=>c.trim()!=="")).map(r=>Object.fromEntries(fields.map((f,i)=>[f,(r[i]||"").trim()])));
+  return{fields,data};
+}
+
+/* ─── THEME ─────────────────────────────────────────────────────────────── */
+const T={
+  bg0:"#18191b",bg1:"#222426",bg2:"#2a2d30",bg3:"#313538",bg4:"#3a3e42",panel:"#1e2022",
+  border:"rgba(255,255,255,0.08)",border2:"rgba(255,255,255,0.14)",
+  green:"#3ecf6e",greenDk:"#2dab57",greenLt:"#72e39a",greenBg:"rgba(62,207,110,0.12)",
+  white:"#f0f0f0",muted:"#9aa0a8",dim:"#5e656e",
+  red:"#e05555",redBg:"rgba(224,85,85,0.1)",amber:"#d49030",blue:"#5b9de8",
+};
+
+/* ─── UTILS ─────────────────────────────────────────────────────────────── */
+function uid(){return Date.now().toString(36)+Math.random().toString(36).slice(2,6);}
+function debounce(fn,ms){let t;return(...a)=>{clearTimeout(t);t=setTimeout(()=>fn(...a),ms);};}
+function fmtDate(iso){if(!iso)return"";return new Date(iso).toLocaleDateString("en-GB",{day:"2-digit",month:"short",year:"2-digit"});}
+
+/* ─── INDEXEDDB (offline cache) ─────────────────────────────────────────── */
+let _db=null;
+async function getDB(){
+  if(_db)return _db;
+  return new Promise((res,rej)=>{
+    const req=indexedDB.open("nexusbase_v5",1);
+    req.onupgradeneeded=e=>{if(!e.target.result.objectStoreNames.contains("store"))e.target.result.createObjectStore("store");};
+    req.onsuccess=e=>{_db=e.target.result;res(_db);};
+    req.onerror=e=>rej(e.target.error);
+  });
+}
+async function idbGet(key){const db=await getDB();return new Promise((res,rej)=>{const r=db.transaction("store","readonly").objectStore("store").get(key);r.onsuccess=()=>res(r.result);r.onerror=()=>rej(r.error);});}
+async function idbSet(key,val){const db=await getDB();return new Promise((res,rej)=>{const r=db.transaction("store","readwrite").objectStore("store").put(val,key);r.onsuccess=()=>res();r.onerror=()=>rej(r.error);});}
+
+/* ─── SEED DATA ─────────────────────────────────────────────────────────── */
+const SEED={
+  folders:[{id:"f1",name:"Getting Started",icon:"ti-rocket"},{id:"f2",name:"Research",icon:"ti-microscope"},{id:"f3",name:"Projects",icon:"ti-layout-kanban"}],
+  notes:[{
+    id:"n1",folderId:"f1",title:"Welcome to NexusBase",
+    content:`<p>Your knowledge base now syncs across all your devices via <strong>Google Drive</strong>.</p>
+<h2>How sync works</h2>
+<ul>
+  <li>Click <strong>Sign in with Google</strong> in the sidebar on each device</li>
+  <li>Notes are saved to a private file in your Google Drive called <code>nexusbase-data.json</code></li>
+  <li>Changes sync automatically every 30 seconds and whenever you make edits</li>
+  <li>If you're offline, notes save locally and sync when you reconnect</li>
+</ul>
+<h2>Setup required</h2>
+<p>See the comment at the top of the HTML source for a 5-minute setup guide — you need a Google Client ID and the file hosted on GitHub Pages.</p>`,
+    tags:["intro","sync"],images:[],links:[
+      {id:"l1",title:"Google Cloud Console",url:"https://console.cloud.google.com",addedAt:new Date().toISOString()},
+      {id:"l2",title:"GitHub Pages Docs",url:"https://docs.github.com/en/pages",addedAt:new Date().toISOString()},
+    ],
+    layers:[{id:"lay1",name:"Annotations",strokes:[],visible:true}],
+    activeLayer:0,pinned:true,createdAt:new Date().toISOString(),updatedAt:new Date().toISOString(),
+  }],
+  lastModified: new Date().toISOString(),
+};
+
+/* ─── REDUCER ───────────────────────────────────────────────────────────── */
+function reducer(state,action){
+  switch(action.type){
+    case"INIT":return{...action.payload,lastModified:new Date().toISOString()};
+    case"ADD_NOTE":return{...state,notes:[action.note,...state.notes],lastModified:new Date().toISOString()};
+    case"UPDATE_NOTE":return{...state,notes:state.notes.map(n=>n.id===action.id?{...n,...action.updates,updatedAt:new Date().toISOString()}:n),lastModified:new Date().toISOString()};
+    case"DELETE_NOTE":return{...state,notes:state.notes.filter(n=>n.id!==action.id),lastModified:new Date().toISOString()};
+    case"ADD_FOLDER":return{...state,folders:[...state.folders,action.folder],lastModified:new Date().toISOString()};
+    case"IMPORT_NOTES":return{...state,notes:[...action.notes,...state.notes],lastModified:new Date().toISOString()};
+    default:return state;
+  }
+}
+
+/* ─── CSS ───────────────────────────────────────────────────────────────── */
+const CSS=`
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap');
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0;}
+:root{
+  --green:#3ecf6e;--greenDk:#2dab57;--greenLt:#72e39a;--greenBg:rgba(62,207,110,0.12);
+  --white:#f0f0f0;--muted:#9aa0a8;--dim:#5e656e;
+  --red:#e05555;--redBg:rgba(224,85,85,0.1);--amber:#d49030;--blue:#5b9de8;
+  --border:rgba(255,255,255,0.08);--border2:rgba(255,255,255,0.14);
+  --r:7px;--r-lg:11px;--r-xl:14px;
+  --font:'Inter',system-ui,sans-serif;--mono:ui-monospace,monospace;--ease:0.13s ease;
+}
+body{font-family:var(--font);}
+.root{display:flex;height:100vh;background:#18191b;color:var(--white);font-family:var(--font);font-size:14px;overflow:hidden;}
+.sb{width:220px;min-width:48px;background:#222426;border-right:1px solid var(--border);display:flex;flex-direction:column;transition:width var(--ease);overflow:hidden;flex-shrink:0;}
+.sb.col{width:48px;}
+.sb-head{display:flex;align-items:center;gap:9px;padding:13px 11px;border-bottom:1px solid var(--border);flex-shrink:0;}
+.sb-logo-dot{width:26px;height:26px;flex-shrink:0;background:var(--green);border-radius:7px;display:flex;align-items:center;justify-content:center;color:#18191b;font-size:14px;font-weight:700;}
+.sb-logo-name{font-size:14px;font-weight:600;white-space:nowrap;}
+.sb-logo-name span{color:var(--green);}
+.sb-search-wrap{padding:8px;position:relative;border-bottom:1px solid var(--border);}
+.sb-search-icon{position:absolute;left:16px;top:50%;transform:translateY(-50%);color:var(--muted);font-size:13px;pointer-events:none;}
+.sb-search{width:100%;background:#313538;border:1px solid var(--border2);border-radius:var(--r);padding:7px 10px 7px 28px;color:var(--white);font-size:12px;font-family:var(--font);outline:none;}
+.sb-search:focus{border-color:var(--green);}
+.sb-body{flex:1;overflow-y:auto;padding:4px 0;}
+.sb-body::-webkit-scrollbar{width:3px;}
+.sb-body::-webkit-scrollbar-thumb{background:#3a3e42;border-radius:3px;}
+.sb-sec{font-size:9px;font-weight:600;letter-spacing:.1em;text-transform:uppercase;color:var(--dim);padding:10px 12px 3px;display:flex;align-items:center;justify-content:space-between;}
+.sb-row{display:flex;align-items:center;gap:8px;padding:7px 10px;margin:1px 5px;border-radius:var(--r);cursor:pointer;transition:background var(--ease);position:relative;overflow:hidden;}
+.sb-row:hover{background:#313538;}
+.sb-row.active{background:#3a3e42;}
+.sb-row.active::before{content:'';position:absolute;left:0;top:5px;bottom:5px;width:2px;background:var(--green);border-radius:0 2px 2px 0;}
+.sb-row-icon{color:var(--green);font-size:15px;flex-shrink:0;}
+.sb-row-name{font-size:12px;flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+.sb-row-badge{font-size:9px;padding:1px 5px;border-radius:8px;background:#3a3e42;color:var(--muted);flex-shrink:0;}
+.sb-foot{border-top:1px solid var(--border);padding:6px;flex-shrink:0;}
+.sb-util-btn{width:100%;display:flex;align-items:center;gap:9px;padding:8px 10px;border-radius:var(--r);background:none;border:none;color:var(--muted);font-family:var(--font);font-size:12px;cursor:pointer;transition:all var(--ease);white-space:nowrap;text-align:left;}
+.sb-util-btn:hover{background:#313538;color:var(--white);}
+.sb-util-btn .sb-util-icon{font-size:15px;flex-shrink:0;}
+/* Sync status strip */
+.sync-strip{display:flex;align-items:center;gap:8px;padding:8px 10px;border-radius:var(--r);margin:2px 0;font-size:12px;}
+.sync-strip.signed-out{background:rgba(255,255,255,0.04);border:1px dashed var(--border2);cursor:pointer;}
+.sync-strip.signed-out:hover{background:#313538;}
+.sync-strip.syncing{background:var(--greenBg);border:1px solid rgba(62,207,110,0.2);}
+.sync-strip.synced{background:var(--greenBg);border:1px solid rgba(62,207,110,0.2);}
+.sync-strip.error{background:var(--redBg);border:1px solid rgba(224,85,85,0.3);}
+.sync-strip.offline{background:rgba(255,255,255,0.04);border:1px solid var(--border);}
+.sync-pip{width:8px;height:8px;border-radius:50%;flex-shrink:0;}
+.sync-pip.green{background:var(--green);}
+.sync-pip.grey{background:var(--muted);}
+.sync-pip.red{background:var(--red);}
+.sync-pip.pulse{animation:pulse 1.5s infinite;}
+@keyframes pulse{0%,100%{opacity:1;}50%{opacity:.3;}}
+/* Note list */
+.nl{width:250px;flex-shrink:0;background:#2a2d30;border-right:1px solid var(--border);display:flex;flex-direction:column;overflow:hidden;}
+.nl-head{display:flex;align-items:center;justify-content:space-between;padding:10px 12px;border-bottom:1px solid var(--border);flex-shrink:0;}
+.nl-title{font-size:13px;font-weight:600;}
+.nl-count{font-size:10px;color:var(--muted);margin-left:4px;}
+.btn-new-note{display:flex;align-items:center;gap:5px;padding:6px 12px;border-radius:20px;background:var(--green);border:none;color:#18191b;font-size:12px;font-weight:600;font-family:var(--font);cursor:pointer;transition:background var(--ease);white-space:nowrap;}
+.btn-new-note:hover{background:var(--greenDk);}
+.nl-scroll{flex:1;overflow-y:auto;}
+.nl-scroll::-webkit-scrollbar{width:3px;}
+.nl-scroll::-webkit-scrollbar-thumb{background:#3a3e42;border-radius:3px;}
+.nc{padding:11px 12px;border-bottom:1px solid var(--border);cursor:pointer;transition:background var(--ease);position:relative;}
+.nc:hover{background:#313538;}
+.nc.active{background:#3a3e42;border-left:2px solid var(--green);}
+.nc-pin{position:absolute;top:10px;right:10px;color:var(--green);font-size:11px;}
+.nc-title{font-size:13px;font-weight:500;padding-right:18px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-bottom:3px;}
+.nc-preview{font-size:11px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-bottom:5px;}
+.nc-foot{display:flex;gap:5px;align-items:center;flex-wrap:wrap;}
+.tag{font-size:10px;padding:1px 7px;border-radius:9px;background:var(--greenBg);color:var(--greenLt);font-weight:500;border:1px solid rgba(62,207,110,0.18);}
+.nc-date{font-size:10px;color:var(--dim);margin-left:auto;}
+.nc-attach{display:flex;gap:4px;}
+.nc-attach i{font-size:11px;color:var(--dim);}
+/* Editor */
+.editor{flex:1;display:flex;flex-direction:column;overflow:hidden;background:#18191b;}
+.ed-tb1{display:flex;align-items:center;gap:6px;padding:8px 14px;background:#222426;border-bottom:1px solid var(--border);flex-shrink:0;flex-wrap:wrap;}
+.btn-group{display:flex;align-items:center;border:1px solid var(--border2);border-radius:var(--r);overflow:hidden;flex-shrink:0;}
+.btn-group-item{display:flex;align-items:center;gap:6px;padding:6px 11px;background:#313538;border:none;border-right:1px solid var(--border);color:var(--white);font-family:var(--font);font-size:12px;font-weight:500;cursor:pointer;transition:all var(--ease);white-space:nowrap;}
+.btn-group-item:last-child{border-right:none;}
+.btn-group-item:hover{background:#3a3e42;}
+.btn-group-item.on{background:var(--greenBg);color:var(--green);}
+.btn-group-item i{font-size:14px;}
+.btn-solid{display:flex;align-items:center;gap:6px;padding:6px 13px;border-radius:var(--r);border:1px solid var(--border2);background:#313538;color:var(--white);font-family:var(--font);font-size:12px;font-weight:500;cursor:pointer;transition:all var(--ease);white-space:nowrap;flex-shrink:0;}
+.btn-solid:hover{background:#3a3e42;}
+.btn-solid.on{background:var(--greenBg);border-color:var(--green);color:var(--green);}
+.btn-solid.danger{background:var(--redBg);border-color:var(--red);color:var(--red);}
+.btn-solid.danger:hover{background:var(--red);color:#f0f0f0;}
+.btn-solid i{font-size:14px;}
+.tb-spacer{flex:1;}
+.tb-sep{width:1px;height:20px;background:var(--border2);margin:0 2px;flex-shrink:0;}
+.ed-tb2{display:flex;align-items:center;gap:4px;padding:5px 14px;background:#2a2d30;border-bottom:1px solid var(--border);flex-shrink:0;flex-wrap:wrap;}
+.fmt-label{font-size:10px;color:var(--muted);font-weight:600;margin-right:2px;letter-spacing:.04em;text-transform:uppercase;}
+.fmt-btn{width:28px;height:28px;display:flex;align-items:center;justify-content:center;background:#313538;border:1px solid var(--border2);border-radius:6px;color:var(--white);font-size:14px;cursor:pointer;transition:all var(--ease);}
+.fmt-btn:hover{background:#3a3e42;}
+.fmt-btn-text{padding:0 10px;height:28px;display:flex;align-items:center;background:#313538;border:1px solid var(--border2);border-radius:6px;color:var(--white);font-size:12px;font-weight:600;cursor:pointer;transition:all var(--ease);}
+.fmt-btn-text:hover{background:#3a3e42;}
+.ed-draw-bar{display:flex;align-items:center;gap:10px;padding:7px 14px;background:#161a1e;border-bottom:1px solid var(--border);flex-shrink:0;flex-wrap:wrap;}
+.draw-label{font-size:11px;color:var(--muted);font-weight:500;}
+.clr-swatch{width:20px;height:20px;border-radius:50%;cursor:pointer;border:2px solid transparent;transition:all var(--ease);flex-shrink:0;}
+.clr-swatch.sel{border-color:var(--white);transform:scale(1.15);}
+.draw-layer-badge{margin-left:auto;font-size:11px;color:var(--greenLt);background:var(--greenBg);border:1px solid rgba(62,207,110,0.2);padding:2px 9px;border-radius:9px;}
+.ed-body{flex:1;display:flex;overflow:hidden;}
+.ed-main{flex:1;display:flex;flex-direction:column;overflow:hidden;position:relative;}
+.ed-title{background:none;border:none;outline:none;color:var(--white);font-size:21px;font-weight:600;font-family:var(--font);padding:18px 22px 8px;width:100%;}
+.ed-title::placeholder{color:#3a3e42;}
+.ed-tags{display:flex;gap:5px;padding:0 22px 12px;flex-wrap:wrap;align-items:center;border-bottom:1px solid var(--border);}
+.tag-x{margin-left:3px;cursor:pointer;color:var(--dim);font-size:11px;}
+.tag-x:hover{color:var(--red);}
+.tag-input-pill{background:none;border:1px dashed var(--border2);border-radius:9px;padding:2px 9px;color:var(--muted);font-size:11px;font-family:var(--font);width:72px;outline:none;}
+.tag-input-pill:focus{border-color:var(--green);color:var(--white);}
+.ed-scroll{flex:1;overflow-y:auto;padding:16px 22px 80px;}
+.ed-scroll::-webkit-scrollbar{width:4px;}
+.ed-scroll::-webkit-scrollbar-thumb{background:#3a3e42;border-radius:4px;}
+.rich{min-height:260px;background:none;border:none;outline:none;color:var(--white);font-family:var(--font);font-size:14px;line-height:1.85;width:100%;word-break:break-word;caret-color:var(--green);}
+.rich:empty::before{content:attr(data-ph);color:#3a3e42;pointer-events:none;}
+.rich h1{font-size:22px;font-weight:600;margin:14px 0 6px;}
+.rich h2{font-size:17px;font-weight:600;margin:12px 0 5px;}
+.rich h3{font-size:14px;font-weight:600;margin:10px 0 4px;}
+.rich strong{color:var(--white);}
+.rich em{color:var(--greenLt);}
+.rich code{font-family:var(--mono);background:#313538;padding:1px 5px;border-radius:4px;font-size:12px;color:var(--amber);}
+.rich ul,.rich ol{padding-left:22px;margin:6px 0;}
+.rich li{margin:3px 0;}
+.rich blockquote{border-left:3px solid var(--green);padding-left:14px;color:var(--muted);margin:8px 0;}
+.rich a{color:var(--blue);}
+.canvas-wrap{position:absolute;inset:0;pointer-events:none;z-index:10;}
+.canvas-wrap.active{pointer-events:all;}
+.canvas-wrap canvas{width:100%;height:100%;display:block;}
+.img-grid{display:flex;gap:8px;flex-wrap:wrap;margin-top:8px;}
+.img-thumb{position:relative;width:112px;height:82px;border-radius:var(--r);overflow:hidden;border:1px solid var(--border2);cursor:zoom-in;}
+.img-thumb img{width:100%;height:100%;object-fit:cover;display:block;}
+.img-rm{position:absolute;top:4px;right:4px;width:20px;height:20px;border-radius:50%;background:rgba(0,0,0,.7);border:none;color:var(--white);font-size:11px;display:flex;align-items:center;justify-content:center;cursor:pointer;}
+.img-rm:hover{background:var(--red);}
+.link-card{display:flex;align-items:center;gap:10px;padding:9px 12px;background:#2a2d30;border-radius:var(--r);border:1px solid var(--border2);margin-top:6px;}
+.link-card-info{flex:1;overflow:hidden;}
+.link-card-title{font-size:12px;font-weight:500;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+.link-card-url{font-size:10px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+.link-card-action{color:var(--muted);font-size:14px;cursor:pointer;}
+.link-card-action:hover{color:var(--green);}
+.sec-h{font-size:10px;font-weight:600;letter-spacing:.08em;text-transform:uppercase;color:var(--muted);margin:18px 0 6px;display:flex;align-items:center;gap:6px;}
+.rp{width:220px;flex-shrink:0;background:#1e2022;border-left:1px solid var(--border);display:flex;flex-direction:column;overflow-y:auto;}
+.rp::-webkit-scrollbar{width:3px;}
+.rp::-webkit-scrollbar-thumb{background:#3a3e42;border-radius:3px;}
+.rp-sec{padding:12px;border-bottom:1px solid var(--border);}
+.rp-label{font-size:9px;font-weight:600;letter-spacing:.1em;text-transform:uppercase;color:var(--dim);margin-bottom:8px;display:flex;align-items:center;justify-content:space-between;}
+.layer-row{display:flex;align-items:center;gap:7px;padding:6px 8px;border-radius:var(--r);cursor:pointer;margin-bottom:2px;transition:background var(--ease);border:1px solid transparent;}
+.layer-row:hover{background:#313538;}
+.layer-row.active{background:var(--greenBg);border-color:rgba(62,207,110,0.2);}
+.layer-name{font-size:12px;flex:1;}
+.layer-count{font-size:10px;color:var(--dim);}
+.layer-vis{font-size:13px;color:var(--dim);cursor:pointer;}
+.layer-vis:hover{color:var(--white);}
+.ql-item{display:flex;align-items:center;gap:7px;padding:6px 8px;border-radius:var(--r);font-size:12px;color:var(--muted);cursor:pointer;transition:all var(--ease);margin-bottom:2px;}
+.ql-item:hover{background:#313538;color:var(--white);}
+.rp-info{font-size:11px;color:var(--muted);line-height:2;}
+.rp-info span{color:var(--white);float:right;}
+.rp-select{width:100%;background:#313538;border:1px solid var(--border2);border-radius:var(--r);padding:6px 10px;color:var(--white);font-family:var(--font);font-size:12px;outline:none;}
+.overlay{position:fixed;inset:0;background:rgba(0,0,0,.78);display:flex;align-items:center;justify-content:center;z-index:200;backdrop-filter:blur(4px);}
+.modal{background:#2a2d30;border:1px solid var(--border2);border-radius:var(--r-xl);padding:24px;width:460px;max-width:95vw;max-height:90vh;overflow-y:auto;}
+.modal-h{font-size:16px;font-weight:600;margin-bottom:16px;display:flex;align-items:center;gap:9px;}
+.modal-h i{color:var(--green);font-size:18px;}
+.m-label{font-size:11px;color:var(--muted);font-weight:500;margin-bottom:5px;letter-spacing:.04em;}
+.m-input{width:100%;background:#18191b;border:1px solid var(--border2);border-radius:var(--r);padding:9px 12px;color:var(--white);font-size:13px;font-family:var(--font);outline:none;transition:border-color var(--ease);}
+.m-input:focus{border-color:var(--green);}
+.m-field{margin-bottom:13px;}
+.m-row{display:flex;gap:9px;justify-content:flex-end;margin-top:18px;}
+.mbtn{display:flex;align-items:center;gap:6px;padding:8px 18px;border-radius:var(--r);border:1px solid var(--border2);background:#313538;color:var(--white);font-family:var(--font);font-size:13px;font-weight:500;cursor:pointer;transition:all var(--ease);}
+.mbtn:hover{background:#3a3e42;}
+.mbtn.pri{background:var(--green);border-color:var(--green);color:#18191b;font-weight:600;}
+.mbtn.pri:hover{background:var(--greenDk);}
+.mbtn:disabled{opacity:.4;pointer-events:none;}
+.icon-grid{display:flex;gap:7px;flex-wrap:wrap;}
+.icon-opt{width:32px;height:32px;border-radius:7px;display:flex;align-items:center;justify-content:center;cursor:pointer;font-size:16px;background:#313538;color:var(--muted);border:1px solid var(--border);transition:all var(--ease);}
+.icon-opt:hover{background:#3a3e42;color:var(--white);}
+.icon-opt.sel{background:var(--green);color:#18191b;border-color:var(--green);}
+.import-wrap{margin-top:10px;border-radius:var(--r);border:1px solid var(--border2);max-height:175px;overflow:auto;}
+.import-tbl{width:100%;border-collapse:collapse;font-size:11px;}
+.import-tbl th{background:#3a3e42;padding:6px 9px;text-align:left;color:var(--greenLt);border-bottom:1px solid var(--border);}
+.import-tbl td{padding:5px 9px;border-bottom:1px solid rgba(255,255,255,0.05);color:var(--white);}
+.import-tbl tr:last-child td{border:none;}
+.cmd-overlay{position:fixed;inset:0;z-index:300;background:rgba(0,0,0,.65);display:flex;align-items:flex-start;justify-content:center;padding-top:10vh;}
+.cmd-box{width:530px;max-width:95vw;background:#2a2d30;border:1px solid var(--border2);border-radius:var(--r-xl);overflow:hidden;box-shadow:0 30px 70px rgba(0,0,0,.7);}
+.cmd-input{width:100%;background:none;border:none;border-bottom:1px solid var(--border);padding:15px 18px;color:var(--white);font-family:var(--font);font-size:15px;outline:none;}
+.cmd-input::placeholder{color:var(--dim);}
+.cmd-results{max-height:340px;overflow-y:auto;}
+.cmd-sec{font-size:10px;color:var(--dim);padding:7px 16px 3px;letter-spacing:.08em;text-transform:uppercase;}
+.cmd-item{display:flex;align-items:center;gap:11px;padding:10px 16px;cursor:pointer;transition:background var(--ease);font-size:13px;}
+.cmd-item:hover,.cmd-item.hi{background:#3a3e42;}
+.cmd-item-icon{color:var(--green);font-size:16px;width:20px;flex-shrink:0;}
+.cmd-kbd{margin-left:auto;font-size:10px;font-family:var(--mono);background:#3a3e42;border:1px solid var(--border2);border-radius:4px;padding:2px 6px;color:var(--muted);}
+.toast{position:fixed;bottom:22px;right:22px;background:#313538;border:1px solid var(--green);border-radius:var(--r-lg);padding:11px 18px;color:var(--white);font-size:13px;z-index:500;display:flex;align-items:center;gap:9px;animation:toastIn .18s ease;}
+@keyframes toastIn{from{transform:translateY(10px);opacity:0}to{transform:translateY(0);opacity:1}}
+@keyframes spin{from{transform:rotate(0deg)}to{transform:rotate(360deg)}}
+.empty{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:10px;color:var(--muted);}
+.empty i{font-size:48px;color:#3a3e42;}
+.empty-title{font-size:15px;font-weight:600;color:var(--white);}
+.empty-sub{font-size:12px;}
+.empty-hint{font-size:11px;color:var(--dim);}
+.lightbox{position:fixed;inset:0;background:rgba(0,0,0,.92);display:flex;align-items:center;justify-content:center;z-index:400;cursor:zoom-out;}
+.lightbox img{max-width:92vw;max-height:90vh;border-radius:var(--r-lg);object-fit:contain;}
+/* Setup banner */
+.setup-banner{background:rgba(212,144,48,0.12);border:1px solid rgba(212,144,48,0.35);border-radius:var(--r);padding:10px 12px;margin:6px;font-size:11px;color:#d49030;line-height:1.6;cursor:pointer;}
+.setup-banner:hover{background:rgba(212,144,48,0.18);}
+.setup-banner strong{display:block;margin-bottom:3px;font-size:12px;}
+@media(max-width:680px){
+  .sb{display:none;}.nl{display:none;}.nl.mob{display:flex;width:100%;}
+  .editor{display:none;}.editor.mob{display:flex;}
+  .mob-back{display:flex !important;}
+  .ed-tb1,.ed-tb2{overflow-x:auto;flex-wrap:nowrap;}
+}
+.mob-back{display:none;}
+::-webkit-scrollbar{width:4px;height:4px;}
+::-webkit-scrollbar-track{background:transparent;}
+::-webkit-scrollbar-thumb{background:#3a3e42;border-radius:4px;}
+`;
+
+/* ─── CANVAS ─────────────────────────────────────────────────────────────── */
+const DrawCanvas=memo(function DrawCanvas({layers,isActive,color,size,onStrokeDone}){
+  const canvasRef=useRef(null);const ctxRef=useRef(null);
+  const drawing=useRef(false);const current=useRef([]);const dirty=useRef(true);
+  useEffect(()=>{
+    const canvas=canvasRef.current;
+    const ro=new ResizeObserver(()=>{
+      const dpr=window.devicePixelRatio||1;const{width,height}=canvas.getBoundingClientRect();
+      canvas.width=width*dpr;canvas.height=height*dpr;
+      const ctx=canvas.getContext("2d");ctx.scale(dpr,dpr);ctxRef.current=ctx;dirty.current=true;
+    });
+    ro.observe(canvas);return()=>ro.disconnect();
+  },[]);
+  useEffect(()=>{
+    let alive=true;
+    const loop=()=>{if(!alive)return;if(dirty.current){redraw();dirty.current=false;}requestAnimationFrame(loop);};
+    requestAnimationFrame(loop);return()=>{alive=false;};
+  });
+  useEffect(()=>{dirty.current=true;},[layers]);
+  function redraw(){
+    const ctx=ctxRef.current;if(!ctx)return;
+    const dpr=window.devicePixelRatio||1;const canvas=canvasRef.current;
+    ctx.clearRect(0,0,canvas.width/dpr,canvas.height/dpr);
+    layers.forEach(l=>{if(l.visible)l.strokes.forEach(s=>stk(ctx,s));});
+  }
+  function stk(ctx,s){
+    if(!s.pts||s.pts.length<2)return;
+    ctx.beginPath();ctx.strokeStyle=s.color;ctx.lineWidth=s.size;ctx.lineCap="round";ctx.lineJoin="round";
+    ctx.moveTo(s.pts[0].x,s.pts[0].y);s.pts.slice(1).forEach(p=>ctx.lineTo(p.x,p.y));ctx.stroke();
+  }
+  function pt(e){const r=canvasRef.current.getBoundingClientRect();const src=e.touches?e.touches[0]:e;return{x:src.clientX-r.left,y:src.clientY-r.top};}
+  function onDown(e){if(!isActive)return;e.preventDefault();drawing.current=true;current.current=[pt(e)];}
+  function onMove(e){
+    if(!drawing.current||!isActive)return;e.preventDefault();current.current.push(pt(e));
+    const ctx=ctxRef.current;if(!ctx)return;
+    const dpr=window.devicePixelRatio||1;const canvas=canvasRef.current;
+    ctx.clearRect(0,0,canvas.width/dpr,canvas.height/dpr);redraw();stk(ctx,{pts:current.current,color,size});
+  }
+  function onUp(){if(!drawing.current)return;drawing.current=false;if(current.current.length>1)onStrokeDone({pts:[...current.current],color,size});current.current=[];dirty.current=true;}
+  return(
+    <div className={`canvas-wrap ${isActive?"active":""}`}>
+      <canvas ref={canvasRef} style={{width:"100%",height:"100%",cursor:isActive?"crosshair":"default"}}
+        onMouseDown={onDown} onMouseMove={onMove} onMouseUp={onUp} onMouseLeave={onUp}
+        onTouchStart={onDown} onTouchMove={onMove} onTouchEnd={onUp}/>
+    </div>
+  );
+});
+
+/* ─── MODALS ─────────────────────────────────────────────────────────────── */
+const SAMPLE_CSV=`title,content,tags\n"Project Alpha","Research complete. Next: prototype.","project;alpha"\n"Meeting Notes","Q3 roadmap discussed.","meeting;q3"`;
+
+const ImportModal=memo(function ImportModal({onClose,onImport}){
+  const[rows,setRows]=useState([]);const[cols,setCols]=useState([]);const[err,setErr]=useState("");
+  const[pasted,setPasted]=useState("");const[tab,setTab]=useState("file");const[fname,setFname]=useState("");
+  function process(text,src){
+    try{const{fields,data}=csvToObjects(text);if(!data.length){setErr("No data rows found.");return;}setCols(fields);setRows(data.slice(0,500));setErr("");setFname(src||"data");}
+    catch(ex){setErr("Parse error: "+ex.message);}
+  }
+  function handleFile(e){const f=e.target.files[0];if(!f)return;setFname(f.name);const r=new FileReader();r.onload=ev=>process(ev.target.result,f.name);r.onerror=()=>setErr("Could not read file.");r.readAsText(f);}
+  function doImport(){
+    const tk=cols.find(c=>/title/i.test(c)),ck=cols.find(c=>/content|body|text|note/i.test(c)),gk=cols.find(c=>/tag/i.test(c));
+    onImport(rows.map((r,i)=>({id:uid(),folderId:null,title:tk?r[tk]||`Imported ${i+1}`:`Imported ${i+1}`,content:ck?`<p>${r[ck]||""}</p>`:`<p>${Object.values(r).join(" | ")}</p>`,tags:gk&&r[gk]?r[gk].split(/[;|,]/).map(t=>t.trim()).filter(Boolean):["imported"],images:[],links:[],layers:[{id:uid(),name:"Annotations",strokes:[],visible:true}],activeLayer:0,pinned:false,createdAt:new Date().toISOString(),updatedAt:new Date().toISOString()})));
+    onClose();
+  }
+  const tabSt=a=>({padding:"6px 14px",border:"none",borderRadius:"6px 6px 0 0",background:a?"#313538":"transparent",color:a?T.white:T.muted,fontFamily:"var(--font)",fontSize:12,fontWeight:500,cursor:"pointer",borderBottom:a?`2px solid ${T.green}`:"2px solid transparent"});
+  return(
+    <div className="overlay" onClick={e=>e.target===e.currentTarget&&onClose()}>
+      <div className="modal" style={{width:520}}>
+        <div className="modal-h"><i className="ti ti-file-spreadsheet"/>Import CSV</div>
+        <div style={{display:"flex",gap:2,borderBottom:`1px solid ${T.border}`,marginBottom:14}}>
+          <button style={tabSt(tab==="file")} onClick={()=>setTab("file")}>Upload File</button>
+          <button style={tabSt(tab==="paste")} onClick={()=>setTab("paste")}>Paste CSV Text</button>
+        </div>
+        {tab==="file"&&<div className="m-field">
+          <div className="m-label">Choose a .csv file</div>
+          <div style={{display:"flex",alignItems:"center",gap:10,padding:"10px 14px",background:T.bg3,borderRadius:8,border:`1px dashed ${T.border2}`}}>
+            <i className="ti ti-upload" style={{fontSize:20,color:T.green}}/>
+            <div style={{flex:1}}><div style={{fontSize:13,fontWeight:500}}>{fname||"No file chosen"}</div><div style={{fontSize:11,color:T.muted}}>CSV or plain text with header row</div></div>
+            <label style={{padding:"6px 14px",background:T.green,borderRadius:6,color:T.bg0,fontSize:12,fontWeight:600,cursor:"pointer"}}>Browse<input type="file" accept=".csv,.tsv,.txt" onChange={handleFile} style={{display:"none"}}/></label>
+          </div>
+        </div>}
+        {tab==="paste"&&<div className="m-field">
+          <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:5}}>
+            <div className="m-label">Paste CSV text</div>
+            <button onClick={()=>{setPasted(SAMPLE_CSV);process(SAMPLE_CSV,"sample");}} style={{fontSize:11,color:T.green,background:"none",border:"none",cursor:"pointer",fontFamily:"var(--font)"}}>Load sample →</button>
+          </div>
+          <textarea className="m-input" rows={6} style={{fontFamily:"monospace",fontSize:12,resize:"vertical"}} placeholder={"title,content,tags\n\"My Note\",\"Content\",\"tag1;tag2\""} value={pasted} onChange={e=>setPasted(e.target.value)}/>
+          <button className="mbtn" style={{marginTop:8}} onClick={()=>process(pasted,"pasted data")}><i className="ti ti-check"/> Parse CSV</button>
+        </div>}
+        {err&&<div style={{background:T.redBg,border:`1px solid ${T.red}`,borderRadius:7,padding:"8px 12px",color:T.red,fontSize:12,marginBottom:10}}>{err}</div>}
+        {rows.length>0&&<div style={{marginTop:4}}>
+          <div style={{fontSize:12,color:T.greenLt,marginBottom:6}}><strong>{rows.length} rows</strong> ready</div>
+          <div className="import-wrap"><table className="import-tbl">
+            <thead><tr>{cols.map(c=><th key={c}>{c}</th>)}</tr></thead>
+            <tbody>{rows.slice(0,5).map((r,i)=><tr key={i}>{cols.map(c=><td key={c}>{String(r[c]||"").slice(0,40)}</td>)}</tr>)}</tbody>
+          </table></div>
+        </div>}
+        <div className="m-row">
+          <button className="mbtn" onClick={onClose}>Cancel</button>
+          <button className="mbtn pri" onClick={doImport} disabled={!rows.length}><i className="ti ti-download"/> Import {rows.length||""} Notes</button>
+        </div>
+      </div>
+    </div>
+  );
+});
+
+const LinkModal=memo(function LinkModal({onClose,onAdd}){
+  const[title,setTitle]=useState("");const[url,setUrl]=useState("");
+  function submit(){if(!url.trim())return;const u=url.startsWith("http")?url:"https://"+url;onAdd({id:uid(),title:title||u,url:u,addedAt:new Date().toISOString()});onClose();}
+  return(
+    <div className="overlay" onClick={e=>e.target===e.currentTarget&&onClose()}>
+      <div className="modal">
+        <div className="modal-h"><i className="ti ti-link"/>Link an Article</div>
+        <div className="m-field"><div className="m-label">Title (optional)</div><input className="m-input" placeholder="Article title…" value={title} onChange={e=>setTitle(e.target.value)} autoFocus/></div>
+        <div className="m-field"><div className="m-label">URL</div><input className="m-input" placeholder="https://…" value={url} onChange={e=>setUrl(e.target.value)} onKeyDown={e=>e.key==="Enter"&&submit()}/></div>
+        <div className="m-row"><button className="mbtn" onClick={onClose}>Cancel</button><button className="mbtn pri" onClick={submit} disabled={!url.trim()}><i className="ti ti-plus"/> Add Link</button></div>
+      </div>
+    </div>
+  );
+});
+
+const FolderModal=memo(function FolderModal({onClose,onAdd}){
+  const[name,setName]=useState("");const[icon,setIcon]=useState("ti-folder");
+  const icons=["ti-folder","ti-rocket","ti-microscope","ti-layout-kanban","ti-book","ti-star","ti-heart","ti-code","ti-camera","ti-chart-bar","ti-brain","ti-globe","ti-shield","ti-music"];
+  function submit(){if(!name.trim())return;onAdd({id:uid(),name:name.trim(),icon});onClose();}
+  return(
+    <div className="overlay" onClick={e=>e.target===e.currentTarget&&onClose()}>
+      <div className="modal">
+        <div className="modal-h"><i className="ti ti-folder-plus"/>New Folder</div>
+        <div className="m-field"><div className="m-label">Name</div><input className="m-input" placeholder="Folder name…" value={name} onChange={e=>setName(e.target.value)} autoFocus onKeyDown={e=>e.key==="Enter"&&submit()}/></div>
+        <div className="m-field"><div className="m-label">Icon</div><div className="icon-grid">{icons.map(ic=><div key={ic} className={`icon-opt ${icon===ic?"sel":""}`} onClick={()=>setIcon(ic)}><i className={`ti ${ic}`}/></div>)}</div></div>
+        <div className="m-row"><button className="mbtn" onClick={onClose}>Cancel</button><button className="mbtn pri" onClick={submit} disabled={!name.trim()}><i className="ti ti-plus"/> Create Folder</button></div>
+      </div>
+    </div>
+  );
+});
+
+/* ─── SYNC PANEL MODAL ───────────────────────────────────────────────────── */
+const SyncModal=memo(function SyncModal({onClose,syncState,onSignIn,onSignOut,noteCount,onExport,userEmail}){
+  const[expDone,setExpDone]=useState(false);
+  const isConfigured=window.GOOGLE_CLIENT_ID&&!window.GOOGLE_CLIENT_ID.startsWith("YOUR_");
+  function doExport(fmt){onExport(fmt);setExpDone(true);setTimeout(()=>setExpDone(false),3000);}
+
+  return(
+    <div className="overlay" onClick={e=>e.target===e.currentTarget&&onClose()}>
+      <div className="modal" style={{width:520}}>
+        <div className="modal-h"><i className="ti ti-cloud"/>Google Drive Sync</div>
+
+        {/* Setup required warning */}
+        {!isConfigured&&(
+          <div style={{background:"rgba(212,144,48,0.12)",border:"1px solid rgba(212,144,48,0.4)",borderRadius:10,padding:"14px 16px",marginBottom:18}}>
+            <div style={{fontWeight:600,color:T.amber,marginBottom:8,display:"flex",alignItems:"center",gap:8}}><i className="ti ti-alert-triangle" style={{fontSize:18}}/>Setup required</div>
+            <div style={{fontSize:12,color:T.muted,lineHeight:1.8}}>
+              To enable Google Drive sync you need to:<br/>
+              <strong style={{color:T.white}}>1.</strong> Host this file on <strong style={{color:T.white}}>GitHub Pages</strong> (free — see guide in HTML source)<br/>
+              <strong style={{color:T.white}}>2.</strong> Create a <strong style={{color:T.white}}>Google Cloud project</strong> and get a Client ID<br/>
+              <strong style={{color:T.white}}>3.</strong> Paste the Client ID into the <code style={{color:T.greenLt,fontFamily:"monospace"}}>GOOGLE_CLIENT_ID</code> variable at the top of the file
+            </div>
+            <a href="https://console.cloud.google.com" target="_blank" style={{display:"inline-flex",alignItems:"center",gap:6,marginTop:10,color:T.green,fontSize:12,textDecoration:"none"}}>
+              <i className="ti ti-external-link"/>Open Google Cloud Console →
+            </a>
+          </div>
+        )}
+
+        {/* Status */}
+        {isConfigured&&(
+          <div style={{background:syncState==="synced"?T.greenBg:syncState==="error"?T.redBg:T.bg3,border:`1px solid ${syncState==="synced"?"rgba(62,207,110,0.3)":syncState==="error"?"rgba(224,85,85,0.3)":T.border}`,borderRadius:9,padding:"14px 16px",marginBottom:18}}>
+            <div style={{display:"flex",alignItems:"center",gap:12}}>
+              <div style={{width:40,height:40,borderRadius:10,background:"rgba(255,255,255,0.06)",display:"flex",alignItems:"center",justifyContent:"center",flexShrink:0}}>
+                <i className={`ti ${syncState==="synced"||syncState==="syncing"?"ti-brand-google":"ti-cloud-off"}`} style={{fontSize:20,color:syncState==="synced"?"#ea4335":syncState==="syncing"?T.green:T.muted}}/>
+              </div>
+              <div style={{flex:1}}>
+                <div style={{fontWeight:600,fontSize:13,color:syncState==="synced"||syncState==="syncing"?T.green:T.white}}>
+                  {syncState==="synced"&&`Synced via Google Drive`}
+                  {syncState==="syncing"&&"Syncing…"}
+                  {syncState==="signed-out"&&"Not signed in"}
+                  {syncState==="error"&&"Sync error"}
+                  {syncState==="offline"&&"Offline — local only"}
+                </div>
+                <div style={{fontSize:11,color:T.muted,marginTop:2}}>
+                  {syncState==="synced"&&`${userEmail} · ${noteCount} notes synced`}
+                  {syncState==="signed-out"&&"Sign in to sync across Mac, Windows, and iPhone"}
+                  {syncState==="error"&&"Could not reach Google Drive — check connection"}
+                  {syncState==="offline"&&"Changes saved locally and will sync when reconnected"}
+                </div>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* Sign in / out */}
+        {isConfigured&&syncState==="signed-out"&&(
+          <button className="mbtn pri" style={{width:"100%",justifyContent:"center",marginBottom:14,padding:"11px 18px"}} onClick={onSignIn}>
+            <i className="ti ti-brand-google" style={{fontSize:16}}/> Sign in with Google
+          </button>
+        )}
+        {isConfigured&&(syncState==="synced"||syncState==="syncing")&&(
+          <button className="mbtn" style={{width:"100%",justifyContent:"center",marginBottom:14}} onClick={onSignOut}>
+            <i className="ti ti-logout"/> Sign out ({userEmail})
+          </button>
+        )}
+
+        {/* How sync works */}
+        {isConfigured&&<>
+          <div style={{borderTop:`1px solid ${T.border}`,margin:"16px 0"}}/>
+          <div style={{fontSize:12,color:T.muted,lineHeight:1.8,marginBottom:16}}>
+            <strong style={{color:T.white,display:"block",marginBottom:6}}>How it works</strong>
+            Notes are stored in a private file (<code style={{color:T.greenLt,fontFamily:"monospace"}}>nexusbase-data.json</code>) in your Google Drive's hidden app folder — only NexusBase can read it, not visible in your normal Drive. Syncs automatically every 30 seconds and on every edit.
+          </div>
+        </>}
+
+        {/* Export */}
+        <div style={{borderTop:`1px solid ${T.border}`,margin:"16px 0"}}/>
+        <div style={{fontSize:11,fontWeight:600,color:T.dim,textTransform:"uppercase",letterSpacing:".08em",marginBottom:10}}>Backup &amp; Export</div>
+        <div style={{display:"flex",gap:10}}>
+          <button className="mbtn" style={{flex:1,justifyContent:"center"}} onClick={()=>doExport("json")}>
+            {expDone?<><i className="ti ti-check" style={{color:T.green}}/> Downloaded!</>:<><i className="ti ti-file-export"/> Export JSON</>}
+          </button>
+          <button className="mbtn" style={{flex:1,justifyContent:"center"}} onClick={()=>doExport("csv")}>
+            <i className="ti ti-table-export"/> Export CSV
+          </button>
+        </div>
+        <div style={{fontSize:11,color:T.dim,marginTop:8}}>JSON = full backup. CSV = spreadsheet-compatible.</div>
+
+        <div className="m-row"><button className="mbtn pri" onClick={onClose}>Done</button></div>
+      </div>
+    </div>
+  );
+});
+
+const CmdPalette=memo(function CmdPalette({onClose,onAction,notes}){
+  const[q,setQ]=useState("");const[hi,setHi]=useState(0);const ref=useRef(null);
+  useEffect(()=>ref.current?.focus(),[]);
+  const cmds=[
+    {id:"new",label:"New Note",icon:"ti-file-plus",kbd:"⌘N",act:"new_note"},
+    {id:"import",label:"Import CSV",icon:"ti-file-import",kbd:"",act:"import"},
+    {id:"folder",label:"New Folder",icon:"ti-folder-plus",kbd:"",act:"new_folder"},
+    {id:"draw",label:"Toggle Draw Mode",icon:"ti-pencil",kbd:"⌘D",act:"toggle_draw"},
+    {id:"sync",label:"Sync & Backup",icon:"ti-cloud",kbd:"",act:"sync"},
+    {id:"link",label:"Link Article",icon:"ti-link",kbd:"",act:"link"},
+  ];
+  const fC=useMemo(()=>q.trim()?cmds.filter(c=>c.label.toLowerCase().includes(q.toLowerCase())):cmds,[q]);
+  const fN=useMemo(()=>q.trim()?notes.filter(n=>n.title.toLowerCase().includes(q.toLowerCase())||n.content.replace(/<[^>]+>/g,"").toLowerCase().includes(q.toLowerCase())).slice(0,5):[],[q,notes]);
+  const total=fC.length+fN.length;
+  useEffect(()=>setHi(0),[q]);
+  function onKey(e){
+    if(e.key==="ArrowDown"){e.preventDefault();setHi(h=>(h+1)%total);}
+    if(e.key==="ArrowUp"){e.preventDefault();setHi(h=>(h-1+total)%total);}
+    if(e.key==="Enter"){if(hi<fC.length){onAction(fC[hi].act);onClose();}else{onAction("open_note",fN[hi-fC.length].id);onClose();}}
+    if(e.key==="Escape")onClose();
+  }
+  return(
+    <div className="cmd-overlay" onClick={e=>e.target===e.currentTarget&&onClose()}>
+      <div className="cmd-box">
+        <input ref={ref} className="cmd-input" placeholder="Search notes or type a command…" value={q} onChange={e=>setQ(e.target.value)} onKeyDown={onKey}/>
+        <div className="cmd-results">
+          {fC.length>0&&<div className="cmd-sec">Commands</div>}
+          {fC.map((c,i)=><div key={c.id} className={`cmd-item ${hi===i?"hi":""}`} onClick={()=>{onAction(c.act);onClose();}} onMouseEnter={()=>setHi(i)}><i className={`ti ${c.icon} cmd-item-icon`}/>{c.label}{c.kbd&&<span className="cmd-kbd">{c.kbd}</span>}</div>)}
+          {fN.length>0&&<div className="cmd-sec">Notes</div>}
+          {fN.map((n,i)=><div key={n.id} className={`cmd-item ${hi===fC.length+i?"hi":""}`} onClick={()=>{onAction("open_note",n.id);onClose();}} onMouseEnter={()=>setHi(fC.length+i)}><i className="ti ti-notes cmd-item-icon"/>{n.title}</div>)}
+          {total===0&&<div style={{padding:"14px 18px",color:T.muted,fontSize:13}}>No results for "{q}"</div>}
+        </div>
+      </div>
+    </div>
+  );
+});
+
+const NoteCard=memo(function NoteCard({note,active,onClick}){
+  const plain=note.content.replace(/<[^>]+>/g,"");
+  return(
+    <div className={`nc ${active?"active":""}`} onClick={onClick} tabIndex={0} onKeyDown={e=>e.key==="Enter"&&onClick()}>
+      {note.pinned&&<i className="ti ti-pin nc-pin"/>}
+      <div className="nc-title">{note.title}</div>
+      <div className="nc-preview">{plain.slice(0,80)||"No content"}</div>
+      <div className="nc-foot">
+        {(note.tags||[]).slice(0,2).map(t=><span key={t} className="tag">{t}</span>)}
+        <div className="nc-attach">
+          {note.images?.length>0&&<i className="ti ti-photo" title="Has images"/>}
+          {note.links?.length>0&&<i className="ti ti-link" title="Has links"/>}
+          {note.layers?.some(l=>l.strokes.length>0)&&<i className="ti ti-pencil" title="Has drawings"/>}
+        </div>
+        <span className="nc-date">{fmtDate(note.updatedAt)}</span>
+      </div>
+    </div>
+  );
+});
+
+function IconBtn({icon,onClick,title}){
+  return(
+    <button onClick={onClick} title={title} style={{width:26,height:26,borderRadius:6,display:"flex",alignItems:"center",justifyContent:"center",background:T.bg3,border:`1px solid ${T.border2}`,color:T.white,fontSize:14,cursor:"pointer",flexShrink:0}}>
+      <i className={`ti ${icon}`}/>
+    </button>
+  );
+}
+
+/* ─── MAIN APP ───────────────────────────────────────────────────────────── */
+function App(){
+  const[state,dispatch]=useReducer(reducer,SEED);
+  const[loaded,setLoaded]=useState(false);
+  const[selFolder,setSF]=useState(null);const[selNote,setSN]=useState("n1");
+  const[search,setSrc]=useState("");const[drawing,setDr]=useState(false);
+  const[dColor,setDC]=useState(T.green);const[dSize,setDS]=useState(3);
+  const[sbCol,setSbc]=useState(false);const[rpOpen,setRP]=useState(true);
+  const[modal,setM]=useState(null);const[toast,setTt]=useState(null);
+  const[lightbox,setLb]=useState(null);const[cmd,setCmd]=useState(false);
+  const[mobV,setMob]=useState("list");const[tagIn,setTI]=useState("");
+
+  /* Sync state */
+  const[syncState,setSyncState]=useState("signed-out"); // signed-out | syncing | synced | error | offline
+  const[userEmail,setUserEmail]=useState("");
+  const[driveFileId,setDriveFileId]=useState(null);
+  const syncStateRef=useRef("signed-out");
+  const driveFileIdRef=useRef(null);
+
+  const fileRef=useRef(null);const camRef=useRef(null);const toastRef=useRef(null);const richRef=useRef(null);
+  const note=selNote?state.notes.find(n=>n.id===selNote):null;
+
+  /* Load from IndexedDB first (offline cache) */
+  useEffect(()=>{
+    idbGet("nb_state_v5").then(s=>{if(s)dispatch({type:"INIT",payload:s});setLoaded(true);}).catch(()=>setLoaded(true));
+  },[]);
+
+  /* Save to IndexedDB on every change (offline cache + debounced Drive sync) */
+  const localSave=useCallback(debounce((s)=>idbSet("nb_state_v5",s).catch(()=>{}),500),[]);
+  useEffect(()=>{if(loaded)localSave(state);},[state,loaded]);
+
+  /* Drive sync — push on every change (debounced 3s) */
+  const drivePush=useCallback(debounce(async(s)=>{
+    if(!tokenValid()||syncStateRef.current==="offline")return;
+    try{
+      setSyncState("syncing");syncStateRef.current="syncing";
+      const res=await writeDriveFile(driveFileIdRef.current,s,_gToken);
+      if(!driveFileIdRef.current&&res?.id){driveFileIdRef.current=res.id;setDriveFileId(res.id);}
+      setSyncState("synced");syncStateRef.current="synced";
+    }catch(e){setSyncState("error");syncStateRef.current="error";console.warn("Drive push failed",e);}
+  },3000),[]);
+  useEffect(()=>{if(loaded&&syncStateRef.current==="synced")drivePush(state);},[state,loaded]);
+
+  /* Drive pull — on sign-in and every 30s */
+  async function drivePull(token){
+    try{
+      let fid=driveFileIdRef.current||await findDriveFile(token);
+      if(fid){
+        driveFileIdRef.current=fid;setDriveFileId(fid);
+        const remote=await readDriveFile(fid,token);
+        if(remote?.notes){
+          // Merge: take whichever is newer per note, then union
+          const local=await idbGet("nb_state_v5")||state;
+          const byId=new Map();
+          [...(local.notes||[]),...(remote.notes||[])].forEach(n=>{
+            const ex=byId.get(n.id);
+            if(!ex||new Date(n.updatedAt)>new Date(ex.updatedAt))byId.set(n.id,n);
+          });
+          const merged={...remote,notes:Array.from(byId.values()),folders:remote.folders||local.folders||SEED.folders};
+          dispatch({type:"INIT",payload:merged});
+          await idbSet("nb_state_v5",merged);
+        }
+      }
+      setSyncState("synced");syncStateRef.current="synced";
+    }catch(e){setSyncState("error");syncStateRef.current="error";console.warn("Drive pull failed",e);}
+  }
+
+  /* Sign in */
+  async function signIn(){
+    const clientId=window.GOOGLE_CLIENT_ID;
+    if(!clientId||clientId.startsWith("YOUR_")){toast_("Paste your Google Client ID into the HTML file first","ti-alert-circle");return;}
+    try{
+      setSyncState("syncing");syncStateRef.current="syncing";
+      const token=await requestGoogleToken(clientId);
+      // Get user info
+      try{const info=await(await fetch("https://www.googleapis.com/oauth2/v3/userinfo",{headers:{Authorization:`Bearer ${token}`}})).json();setUserEmail(info.email||"");}catch{}
+      await drivePull(token);
+      toast_("Signed in and synced","ti-cloud-check");
+    }catch(e){setSyncState("signed-out");syncStateRef.current="signed-out";toast_("Sign-in cancelled or failed","ti-alert-circle");}
+  }
+
+  function signOut(){_gToken=null;_tokenExpiry=0;setSyncState("signed-out");syncStateRef.current="signed-out";setUserEmail("");toast_("Signed out","ti-logout");}
+
+  /* Periodic pull every 30s when signed in */
+  useEffect(()=>{
+    const interval=setInterval(()=>{if(tokenValid())drivePull(_gToken);},30000);
+    return()=>clearInterval(interval);
+  },[]);
+
+  /* Offline detection */
+  useEffect(()=>{
+    const goOffline=()=>{if(syncState!=="signed-out"){setSyncState("offline");syncStateRef.current="offline";}};
+    const goOnline=()=>{if(syncStateRef.current==="offline"&&tokenValid()){setSyncState("syncing");drivePull(_gToken);}};
+    window.addEventListener("offline",goOffline);window.addEventListener("online",goOnline);
+    return()=>{window.removeEventListener("offline",goOffline);window.removeEventListener("online",goOnline);};
+  },[syncState]);
+
+  function toast_(msg,icon="ti-check"){clearTimeout(toastRef.current);setTt({msg,icon});toastRef.current=setTimeout(()=>setTt(null),2800);}
+
+  useEffect(()=>{
+    const h=(e)=>{
+      const m=e.metaKey||e.ctrlKey;
+      if(m&&e.key==="k"){e.preventDefault();setCmd(p=>!p);}
+      if(m&&e.key==="n"){e.preventDefault();newNote();}
+      if(m&&e.key==="d"){e.preventDefault();setDr(d=>!d);}
+      if(e.key==="Escape"){setCmd(false);setM(null);setDr(false);}
+    };
+    window.addEventListener("keydown",h);return()=>window.removeEventListener("keydown",h);
+  },[]);
+
+  const updateNote=useCallback((id,updates)=>dispatch({type:"UPDATE_NOTE",id,updates}),[]);
+  function newNote(){const n={id:uid(),folderId:selFolder,title:"Untitled Note",content:"",tags:[],images:[],links:[],layers:[{id:uid(),name:"Annotations",strokes:[],visible:true}],activeLayer:0,pinned:false,createdAt:new Date().toISOString(),updatedAt:new Date().toISOString()};dispatch({type:"ADD_NOTE",note:n});setSN(n.id);setMob("editor");}
+  function delNote(id){dispatch({type:"DELETE_NOTE",id});if(selNote===id){setSN(null);setMob("list");}toast_("Note deleted","ti-trash");}
+  function addStroke(s){if(!note)return;const layers=note.layers.map((l,i)=>i===(note.activeLayer??0)?{...l,strokes:[...l.strokes,s]}:l);updateNote(note.id,{layers});}
+  function addLayer(){if(!note)return;const layers=[...note.layers,{id:uid(),name:`Layer ${note.layers.length+1}`,strokes:[],visible:true}];updateNote(note.id,{layers,activeLayer:layers.length-1});toast_("Layer added");}
+  function clearLayer(){if(!note)return;const layers=note.layers.map((l,i)=>i===(note.activeLayer??0)?{...l,strokes:[]}:l);updateNote(note.id,{layers});toast_("Layer cleared","ti-eraser");}
+  function toggleVis(idx){if(!note)return;const layers=note.layers.map((l,i)=>i===idx?{...l,visible:!l.visible}:l);updateNote(note.id,{layers});}
+  function handleImages(e){const files=Array.from(e.target.files);files.forEach(f=>{const r=new FileReader();r.onload=ev=>updateNote(note.id,{images:[...(note.images||[]),{id:uid(),src:ev.target.result,name:f.name}]});r.readAsDataURL(f);});toast_(`${files.length} image${files.length>1?"s":""} added`,"ti-photo");}
+  function rmImage(id){updateNote(note.id,{images:note.images.filter(i=>i.id!==id)});}
+  function addLink(l){updateNote(note.id,{links:[...(note.links||[]),l]});toast_("Link added","ti-link");}
+  function rmLink(id){updateNote(note.id,{links:note.links.filter(l=>l.id!==id)});}
+  function addTag(t){t=t.trim().toLowerCase();if(!t||note.tags.includes(t))return;updateNote(note.id,{tags:[...note.tags,t]});}
+  function importNotes(notes){dispatch({type:"IMPORT_NOTES",notes});toast_(`${notes.length} notes imported`,"ti-file-check");}
+
+  function exportNotes(format="json"){
+    const plain=state.notes.map(n=>({...n,content:n.content.replace(/<[^>]+>/g,""),images:n.images.map(i=>({id:i.id,name:i.name})),layers:n.layers.map(l=>({...l,strokes:l.strokes.length+" strokes"}))}));
+    let blob,filename;
+    if(format==="csv"){
+      const hdr="title,content,tags,folder,createdAt";
+      const rows=plain.map(n=>[`"${(n.title||"").replace(/"/g,'""')}"`,`"${(n.content||"").replace(/"/g,'""').replace(/\n/g," ")}"`,`"${(n.tags||[]).join(";")}"`,`"${state.folders.find(f=>f.id===n.folderId)?.name||""}"`,n.createdAt].join(","));
+      blob=new Blob([[hdr,...rows].join("\n")],{type:"text/csv"});filename=`nexusbase-${new Date().toISOString().slice(0,10)}.csv`;
+    }else{
+      blob=new Blob([JSON.stringify({exported:new Date().toISOString(),notes:plain,folders:state.folders},null,2)],{type:"application/json"});filename=`nexusbase-${new Date().toISOString().slice(0,10)}.json`;
+    }
+    const a=document.createElement("a");a.href=URL.createObjectURL(blob);a.download=filename;a.click();URL.revokeObjectURL(a.href);
+    toast_(`Exported as ${format.toUpperCase()}`,"ti-file-check");
+  }
+
+  function cmdAction(act,payload){
+    if(act==="new_note")newNote();if(act==="import")setM("import");if(act==="new_folder")setM("folder");
+    if(act==="toggle_draw")setDr(d=>!d);if(act==="sync")setM("sync");if(act==="link")setM("link");
+    if(act==="open_note"){setSN(payload);setMob("editor");}
+  }
+  function execFmt(cmd,val){richRef.current?.focus();document.execCommand(cmd,false,val);}
+
+  const filtered=useMemo(()=>state.notes.filter(n=>{const inF=selFolder?n.folderId===selFolder:true;const q=search.toLowerCase();return inF&&(!q||n.title.toLowerCase().includes(q)||n.content.replace(/<[^>]+>/g,"").toLowerCase().includes(q)||(n.tags||[]).some(t=>t.includes(q)));}).sort((a,b)=>(b.pinned?1:0)-(a.pinned?1:0)),[state.notes,selFolder,search]);
+  const fCount=useCallback(fid=>state.notes.filter(n=>n.folderId===fid).length,[state.notes]);
+  const SWATCHES=[T.green,"#ffffff",T.red,T.amber,T.blue,"#cc55e0","#ff8c42"];
+  const isConfigured=window.GOOGLE_CLIENT_ID&&!window.GOOGLE_CLIENT_ID.startsWith("YOUR_");
+
+  /* Sync status strip data */
+  const syncInfo={
+    "signed-out":{pip:"grey",label:isConfigured?"Sign in to sync":"Setup required",cls:"signed-out",icon:"ti-brand-google"},
+    "syncing"   :{pip:"pulse green",label:"Syncing…",cls:"syncing",icon:"ti-refresh"},
+    "synced"    :{pip:"green",label:`Synced · ${userEmail||"Google"}`,cls:"synced",icon:"ti-cloud-check"},
+    "error"     :{pip:"red",label:"Sync error — tap to retry",cls:"error",icon:"ti-cloud-x"},
+    "offline"   :{pip:"grey",label:"Offline — saved locally",cls:"offline",icon:"ti-wifi-off"},
+  }[syncState]||{pip:"grey",label:"Unknown",cls:"offline",icon:"ti-cloud"};
+
+  if(!loaded)return(<div style={{background:T.bg0,color:T.white,height:"100vh",display:"flex",alignItems:"center",justifyContent:"center",fontFamily:"Inter,sans-serif",gap:10}}><i className="ti ti-loader" style={{fontSize:24,color:T.green,animation:"spin 1s linear infinite"}}/> Loading…</div>);
+
+  return(
+    <>
+      <style>{CSS}</style>
+      <div className="root">
+
+        {/* SIDEBAR */}
+        <nav className={`sb ${sbCol?"col":""}`}>
+          <div className="sb-head">
+            <div className="sb-logo-dot"><i className="ti ti-database"/></div>
+            {!sbCol&&<span className="sb-logo-name">Nexus<span>Base</span></span>}
+          </div>
+
+          {!sbCol&&<div className="sb-search-wrap"><i className="ti ti-search sb-search-icon"/><input className="sb-search" placeholder="Search notes…" value={search} onChange={e=>setSrc(e.target.value)}/></div>}
+
+          {!sbCol&&<div className="sb-body">
+            <div className="sb-sec">Folders<IconBtn icon="ti-plus" onClick={()=>setM("folder")} title="New folder"/></div>
+            {[{id:null,name:"All Notes",icon:"ti-home",count:state.notes.length},...state.folders.map(f=>({...f,count:fCount(f.id)}))].map(f=>(
+              <div key={f.id||"all"} className={`sb-row ${selFolder===f.id?"active":""}`} onClick={()=>setSF(f.id)} tabIndex={0}>
+                <i className={`ti ${f.icon} sb-row-icon`}/><span className="sb-row-name">{f.name}</span><span className="sb-row-badge">{f.count}</span>
+              </div>
+            ))}
+          </div>}
+
+          <div className="sb-foot">
+            {!sbCol&&<>
+              {/* Sync strip — tappable */}
+              <div className={`sync-strip ${syncInfo.cls}`} onClick={syncState==="signed-out"&&isConfigured?signIn:()=>setM("sync")}>
+                <i className={`ti ${syncInfo.icon}`} style={{fontSize:15,flexShrink:0,color:syncState==="synced"?T.green:syncState==="error"?T.red:T.muted}}/>
+                <span style={{flex:1,fontSize:11,color:syncState==="synced"?T.green:syncState==="error"?T.red:T.white,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{syncInfo.label}</span>
+                {syncState==="signed-out"&&isConfigured&&<i className="ti ti-arrow-right" style={{fontSize:12,color:T.green,flexShrink:0}}/>}
+              </div>
+              {!isConfigured&&<div className="setup-banner" onClick={()=>setM("sync")}><strong><i className="ti ti-alert-triangle" style={{marginRight:5}}/>Sync setup required</strong>Tap here to see the setup guide for Google Drive sync.</div>}
+              <button className="sb-util-btn" onClick={()=>setCmd(true)}><i className="ti ti-terminal sb-util-icon"/>Command Palette<span style={{marginLeft:"auto",fontSize:10,color:T.dim}}>⌘K</span></button>
+              <button className="sb-util-btn" onClick={()=>setM("import")}><i className="ti ti-file-import sb-util-icon"/>Import CSV</button>
+              <button className="sb-util-btn" onClick={()=>exportNotes("json")}><i className="ti ti-file-export sb-util-icon"/>Export Backup</button>
+            </>}
+            <button className="sb-util-btn" onClick={()=>setSbc(c=>!c)} title={sbCol?"Expand":"Collapse"}>
+              <i className={`ti ${sbCol?"ti-layout-sidebar-right":"ti-layout-sidebar-left"} sb-util-icon`}/>{!sbCol&&"Collapse"}
+            </button>
+          </div>
+        </nav>
+
+        {/* NOTE LIST */}
+        <div className={`nl ${mobV==="list"?"mob":""}`}>
+          <div className="nl-head">
+            <span className="nl-title">{selFolder?(state.folders.find(f=>f.id===selFolder)?.name||"Notes"):"All Notes"}<span className="nl-count">({filtered.length})</span></span>
+            <button className="btn-new-note" onClick={newNote}><i className="ti ti-plus"/> New Note</button>
+          </div>
+          <div className="nl-scroll">
+            {filtered.length===0&&<div style={{padding:"28px 16px",textAlign:"center",color:T.muted,fontSize:13}}><i className="ti ti-notes-off" style={{fontSize:28,display:"block",marginBottom:8}}/>No notes here yet</div>}
+            {filtered.map(n=><NoteCard key={n.id} note={n} active={selNote===n.id} onClick={()=>{setSN(n.id);setMob("editor");}}/>)}
+          </div>
+        </div>
+
+        {/* EDITOR */}
+        <main className={`editor ${mobV==="editor"?"mob":""}`}>
+          {!note?(
+            <div className="empty">
+              <i className="ti ti-notebook"/>
+              <div className="empty-title">No note selected</div>
+              <div className="empty-sub">Select a note or create a new one</div>
+              <button className="btn-new-note" style={{marginTop:8}} onClick={newNote}><i className="ti ti-plus"/> New Note</button>
+              <div className="empty-hint">Ctrl/⌘K — command palette</div>
+            </div>
+          ):(
+            <>
+              <div className="ed-tb1">
+                <button className="btn-solid mob-back" onClick={()=>setMob("list")}><i className="ti ti-arrow-left"/> Back</button>
+                <div className="btn-group">
+                  <button className={`btn-group-item ${note.pinned?"on":""}`} onClick={()=>updateNote(note.id,{pinned:!note.pinned})}><i className={`ti ${note.pinned?"ti-pin-filled":"ti-pin"}`}/>{note.pinned?"Pinned":"Pin"}</button>
+                </div>
+                <div className="btn-group">
+                  <button className="btn-group-item" onClick={()=>fileRef.current.click()}><i className="ti ti-photo"/> Add Image</button>
+                  <button className="btn-group-item" onClick={()=>camRef.current.click()}><i className="ti ti-camera"/> Camera</button>
+                  <button className="btn-group-item" onClick={()=>setM("link")}><i className="ti ti-link"/> Link Article</button>
+                </div>
+                <div className="btn-group">
+                  <button className={`btn-group-item ${drawing?"on":""}`} onClick={()=>setDr(d=>!d)}><i className="ti ti-pencil"/>{drawing?"Exit Draw":"Draw"}</button>
+                  {drawing&&<><button className="btn-group-item" onClick={addLayer}><i className="ti ti-layers-intersect"/> New Layer</button><button className="btn-group-item" onClick={clearLayer}><i className="ti ti-eraser"/> Clear Layer</button></>}
+                </div>
+                <div className="tb-spacer"/>
+                <button className={`btn-solid ${rpOpen?"on":""}`} onClick={()=>setRP(o=>!o)}><i className="ti ti-layout-sidebar-right"/>{rpOpen?"Hide Panel":"Show Panel"}</button>
+                <button className="btn-solid danger" onClick={()=>delNote(note.id)}><i className="ti ti-trash"/> Delete</button>
+              </div>
+
+              <div className="ed-tb2">
+                <span className="fmt-label">Format</span><div className="tb-sep"/>
+                <button className="fmt-btn-text" onMouseDown={e=>{e.preventDefault();execFmt("bold");}}><strong>B</strong></button>
+                <button className="fmt-btn-text" onMouseDown={e=>{e.preventDefault();execFmt("italic");}} style={{fontStyle:"italic"}}>I</button>
+                <button className="fmt-btn-text" onMouseDown={e=>{e.preventDefault();execFmt("underline");}} style={{textDecoration:"underline"}}>U</button>
+                <div className="tb-sep"/>
+                <button className="fmt-btn" onMouseDown={e=>{e.preventDefault();execFmt("formatBlock","h2");}} title="Heading 2"><i className="ti ti-heading"/></button>
+                <button className="fmt-btn" onMouseDown={e=>{e.preventDefault();execFmt("formatBlock","h3");}} title="Heading 3"><i className="ti ti-h-3"/></button>
+                <button className="fmt-btn" onMouseDown={e=>{e.preventDefault();execFmt("formatBlock","blockquote");}} title="Quote"><i className="ti ti-quote"/></button>
+                <div className="tb-sep"/>
+                <button className="fmt-btn" onMouseDown={e=>{e.preventDefault();execFmt("insertUnorderedList");}} title="Bullet list"><i className="ti ti-list"/></button>
+                <button className="fmt-btn" onMouseDown={e=>{e.preventDefault();execFmt("insertOrderedList");}} title="Numbered list"><i className="ti ti-list-numbers"/></button>
+                <div className="tb-sep"/>
+                <select style={{background:T.bg3,border:`1px solid ${T.border2}`,borderRadius:6,padding:"4px 8px",color:T.white,fontSize:12,cursor:"pointer",outline:"none"}} onChange={e=>{execFmt("fontName",e.target.value);e.target.value="";}}>
+                  <option value="">Font…</option><option value="Inter">Sans</option><option value="ui-monospace">Mono</option><option value="Georgia">Serif</option>
+                </select>
+              </div>
+
+              {drawing&&<div className="ed-draw-bar">
+                <span className="draw-label">Colour:</span>
+                {SWATCHES.map(c=><div key={c} className={`clr-swatch ${dColor===c?"sel":""}`} style={{background:c}} onClick={()=>setDC(c)}/>)}
+                <div style={{width:1,height:16,background:T.border2,margin:"0 4px"}}/>
+                <span className="draw-label">Size: {dSize}px</span>
+                <input type="range" min={1} max={24} step={1} value={dSize} onChange={e=>setDS(+e.target.value)} style={{width:80}}/>
+                <span className="draw-layer-badge"><i className="ti ti-layers-subtract"/> {note.layers[note.activeLayer??0]?.name}</span>
+              </div>}
+
+              <div className="ed-body">
+                <div className="ed-main">
+                  <DrawCanvas layers={note.layers} isActive={drawing} color={dColor} size={dSize} onStrokeDone={addStroke}/>
+                  <input className="ed-title" value={note.title} onChange={e=>updateNote(note.id,{title:e.target.value})} placeholder="Note title…"/>
+                  <div className="ed-tags">
+                    {(note.tags||[]).map(t=><span key={t} className="tag">{t}<span className="tag-x" onClick={()=>updateNote(note.id,{tags:note.tags.filter(x=>x!==t)})}>×</span></span>)}
+                    <input className="tag-input-pill" placeholder="+ add tag" value={tagIn} onChange={e=>setTI(e.target.value)} onKeyDown={e=>{if(e.key==="Enter"||e.key===","){addTag(tagIn.replace(/,$/,""));setTI("");e.preventDefault();}}}/>
+                  </div>
+                  <div className="ed-scroll">
+                    <div ref={richRef} className="rich" contentEditable suppressContentEditableWarning data-ph="Start writing…" dangerouslySetInnerHTML={{__html:note.content}} onInput={e=>updateNote(note.id,{content:e.currentTarget.innerHTML})}/>
+                    {note.images?.length>0&&<>
+                      <div className="sec-h"><i className="ti ti-photo"/> Images ({note.images.length})</div>
+                      <div className="img-grid">{note.images.map(img=><div key={img.id} className="img-thumb" onClick={()=>setLb(img.src)}><img src={img.src} alt={img.name} loading="lazy"/><button className="img-rm" onClick={e=>{e.stopPropagation();rmImage(img.id);}}><i className="ti ti-x"/></button></div>)}</div>
+                    </>}
+                    {note.links?.length>0&&<>
+                      <div className="sec-h"><i className="ti ti-link"/> Linked Articles ({note.links.length})</div>
+                      {note.links.map(l=><div key={l.id} className="link-card"><i className="ti ti-world" style={{color:T.green,fontSize:16,flexShrink:0}}/><div className="link-card-info"><div className="link-card-title">{l.title}</div><div className="link-card-url">{l.url}</div></div><i className="ti ti-external-link link-card-action" onClick={()=>window.open(l.url,"_blank")}/><i className="ti ti-x link-card-action" onClick={()=>rmLink(l.id)} style={{marginLeft:4}}/></div>)}
+                    </>}
+                  </div>
+                </div>
+
+                {rpOpen&&<aside className="rp">
+                  <div className="rp-sec">
+                    <div className="rp-label">Layers<IconBtn icon="ti-plus" onClick={addLayer} title="Add layer"/></div>
+                    {note.layers.map((l,idx)=>(
+                      <div key={l.id} className={`layer-row ${(note.activeLayer??0)===idx?"active":""}`} onClick={()=>updateNote(note.id,{activeLayer:idx})}>
+                        <i className="ti ti-layers-subtract" style={{fontSize:13,color:T.green}}/><span className="layer-name">{l.name}</span><span className="layer-count">{l.strokes.length}</span>
+                        <i className={`ti ${l.visible?"ti-eye":"ti-eye-off"} layer-vis`} onClick={e=>{e.stopPropagation();toggleVis(idx);}}/>
+                      </div>
+                    ))}
+                  </div>
+                  {note.links?.length>0&&<div className="rp-sec">
+                    <div className="rp-label">Quick Links</div>
+                    {note.links.map(l=><div key={l.id} className="ql-item" onClick={()=>window.open(l.url,"_blank")}><i className="ti ti-world" style={{color:T.green,fontSize:13}}/>{l.title.length>22?l.title.slice(0,22)+"…":l.title}</div>)}
+                  </div>}
+                  <div className="rp-sec">
+                    <div className="rp-label">Folder</div>
+                    <select className="rp-select" value={note.folderId||""} onChange={e=>updateNote(note.id,{folderId:e.target.value||null})}>
+                      <option value="">No folder</option>{state.folders.map(f=><option key={f.id} value={f.id}>{f.name}</option>)}
+                    </select>
+                  </div>
+                  <div className="rp-sec">
+                    <div className="rp-label">Note Info</div>
+                    <div className="rp-info">
+                      <div>Created<span>{fmtDate(note.createdAt)}</span></div>
+                      <div>Updated<span>{fmtDate(note.updatedAt)}</span></div>
+                      <div>Images<span>{note.images?.length||0}</span></div>
+                      <div>Links<span>{note.links?.length||0}</span></div>
+                      <div>Layers<span>{note.layers?.length||0}</span></div>
+                      <div>Sync<span style={{color:syncState==="synced"?T.green:T.muted}}>{syncState}</span></div>
+                    </div>
+                  </div>
+                </aside>}
+              </div>
+            </>
+          )}
+        </main>
+      </div>
+
+      <input ref={fileRef} type="file" accept="image/*" multiple style={{display:"none"}} onChange={handleImages}/>
+      <input ref={camRef} type="file" accept="image/*" capture="environment" style={{display:"none"}} onChange={handleImages}/>
+
+      {modal==="import"&&<ImportModal onClose={()=>setM(null)} onImport={importNotes}/>}
+      {modal==="link"&&note&&<LinkModal onClose={()=>setM(null)} onAdd={addLink}/>}
+      {modal==="sync"&&<SyncModal onClose={()=>setM(null)} syncState={syncState} onSignIn={signIn} onSignOut={signOut} noteCount={state.notes.length} onExport={exportNotes} userEmail={userEmail}/>}
+      {modal==="folder"&&<FolderModal onClose={()=>setM(null)} onAdd={f=>dispatch({type:"ADD_FOLDER",folder:f})}/>}
+      {cmd&&<CmdPalette onClose={()=>setCmd(false)} onAction={cmdAction} notes={state.notes}/>}
+      {lightbox&&<div className="lightbox" onClick={()=>setLb(null)}><img src={lightbox} alt="Full size" onClick={e=>e.stopPropagation()}/></div>}
+      {toast&&<div className="toast"><i className={`ti ${toast.icon}`} style={{color:T.green}}/>{toast.msg}</div>}
+    </>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<App/>);
+</script>
+</body>
+</html>
